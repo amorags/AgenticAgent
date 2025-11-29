@@ -1,39 +1,44 @@
 from autogen import ConversableAgent
-from typing import Annotated, Literal
-from feedback_agent.config import LLM_CONFIG
+from research_agent.agent.config import LLM_CONFIG
 
-def create_calculator_agent() -> ConversableAgent:
-    # define the agent
+
+def create_test_agent() -> ConversableAgent:
+    """Create a simple test agent to verify API connection"""
     agent = ConversableAgent(
-        name="Calculator Agent",
-        system_message="You are a helpful AI assistant. "
-                      "You can help with simple calculations. "
-                      "Reflect on the order of operations and calculate the result. "
-                      "Return 'TERMINATE' when the task is done.",
+        name="Test Agent",
+        system_message="You are a helpful AI assistant. Keep responses brief.",
         llm_config=LLM_CONFIG,
     )
-
-    # add the tools to the agent
-    agent.register_for_llm(name="calculator", description="A simple calculator")(calculator)
-
     return agent
 
+
 def create_user_proxy():
+    """Create a user proxy for interaction"""
     user_proxy = ConversableAgent(
         name="User",
         llm_config=False,
         is_termination_msg=lambda msg: msg.get("content") is not None and "TERMINATE" in msg["content"],
         human_input_mode="NEVER",
     )
-    user_proxy.register_for_execution(name="calculator")(calculator)
     return user_proxy
 
 
 def main():
+    """Test that the API connection works"""
+    print("Testing Mistral API connection...")
+    
     user_proxy = create_user_proxy()
-    calculator_agent = create_calculator_agent()
-    chat_result = user_proxy.initiate_chat(calculator_agent, cache=None, message="What is (44232 + 13312 / (232 - 32)) * 5?")
+    test_agent = create_test_agent()
+    
+    chat_result = user_proxy.initiate_chat(
+        test_agent, 
+        message="Hello! Please respond with 'API connection successful' and then TERMINATE.",
+        max_turns=1
+    )
+    
+    print("\n✅ Test completed successfully!")
     print(chat_result)
+
 
 if __name__ == "__main__":
     main()
