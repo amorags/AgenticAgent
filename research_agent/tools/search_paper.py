@@ -13,7 +13,7 @@ def search_papers(
     year: Optional[int] = None,
     min_citations: Optional[int] = None,
     year_filter: Literal["exact", "before", "after"] = "exact",
-    limit: int = 5
+    limit: int = 20
 ) -> List[Dict]:
     """
     Search for research papers using Semantic Scholar API.
