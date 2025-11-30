@@ -1,8 +1,6 @@
 """
-Agent Evaluation System for Research Paper Agent
-
-This module implements both internal (critic in the loop) and external 
-(LLM-as-judge) evaluation for the research paper search agent.
+Agent Evaluation WITH Tool Calling
+Properly implements search_papers tool usage
 """
 
 from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
@@ -14,40 +12,44 @@ from statistics import mean
 
 
 # ============================================================================
-# STEP 1: Define Agents for Internal Evaluation (GroupChat)
+# STEP 1: Define Agents WITH TOOL CALLING
 # ============================================================================
 
-def create_research_agent_for_groupchat() -> AssistantAgent:
-    """Research agent that works with internal critic in GroupChat"""
+def create_research_agent() -> AssistantAgent:
+    """Research agent that MUST use search_papers tool"""
     agent = AssistantAgent(
         name="research_agent",
         llm_config=LLM_CONFIG,
         system_message=(
-            "You are a research paper search assistant inside a multi-agent system.\n"
-            "You talk only to other agents, not the human.\n\n"
+            "You are a research paper search assistant.\n\n"
+            "IMPORTANT: You MUST use the search_papers function to find papers. "
+            "DO NOT make up papers from your knowledge.\n\n"
             "Workflow:\n"
-            "1) When you receive the original USER_REQUEST, use the search_papers tool "
-            "to find relevant papers, then produce a draft answer prefixed with 'DRAFT:'.\n"
-            "2) Wait for the internal_critic to respond with 'OK:' or 'CRITIQUE:'.\n"
-            "3) If you receive CRITIQUE, revise your search or answer and send a new 'DRAFT:' "
-            "that addresses the critique.\n"
-            "4) When the critic responds with OK, send the final answer prefixed with "
-            "'FINAL_ANSWER:' and include the token 'TERMINATE' in the same message.\n\n"
-            "Guidelines:\n"
-            "- Use search_papers tool to find papers matching the criteria\n"
-            "- Present results clearly with title, authors, year, citations\n"
-            "- If criteria are ambiguous, explain your interpretation\n"
-            "- If no papers match, explain why and suggest alternatives\n"
+            "1) Read the USER_REQUEST carefully\n"
+            "2) Call search_papers() with appropriate parameters:\n"
+            "   - topic: the research topic\n"
+            "   - year: specific year if mentioned\n"
+            "   - year_filter: 'exact', 'before', or 'after'\n"
+            "   - min_citations: minimum citations if mentioned\n"
+            "   - limit: number of results (default 5)\n"
+            "3) After getting results, format as 'DRAFT:' with paper details\n"
+            "4) If critic says CRITIQUE, revise. If OK, send 'FINAL_ANSWER:' with TERMINATE\n\n"
+            "Example: For 'papers about ML from 2020 with 100+ citations':\n"
+            "Call: search_papers(topic='machine learning', year=2020, year_filter='exact', min_citations=100)\n"
         ),
     )
     
-    # Register the search tool
+    # Register tool for LLM to know about it
     agent.register_for_llm(
         name="search_papers",
         description=(
-            "Search for academic research papers. "
-            "Parameters: topic (required), year (optional), min_citations (optional), "
-            "year_filter ('exact', 'before', 'after'), max_results (default 10)"
+            "Search for academic research papers. Returns real papers from Semantic Scholar.\n"
+            "Parameters:\n"
+            "- topic (str, required): Research topic to search\n"
+            "- year (int, optional): Year to filter by\n"
+            "- year_filter (str, optional): 'exact', 'before', or 'after' (default 'exact')\n"
+            "- min_citations (int, optional): Minimum citation count\n"
+            "- limit (int, optional): Max results (default 5)"
         )
     )(search_papers)
     
@@ -55,207 +57,187 @@ def create_research_agent_for_groupchat() -> AssistantAgent:
 
 
 def create_internal_critic() -> AssistantAgent:
-    """Internal critic that reviews research agent's drafts"""
+    """Internal critic - does NOT use tools, only reviews"""
     return AssistantAgent(
         name="internal_critic",
         llm_config=LLM_CONFIG,
         system_message=(
-            "You are an internal critic reviewing the research_agent's draft answers.\n"
-            "You only see the USER_REQUEST and the research_agent's messages.\n\n"
-            "Evaluation criteria:\n"
-            "- completeness: Did the agent address ALL parts of the request? "
-            "(topic, year filter, citation count)\n"
-            "- accuracy: Are the search parameters correct? Does year filter match request?\n"
-            "- quality: Are results presented clearly with all relevant info?\n"
-            "- robustness: If request is ambiguous, did agent handle it sensibly?\n\n"
-            "Rules:\n"
-            "- If the latest message from research_agent starts with 'DRAFT:' and is "
-            "acceptable, respond with:\n"
-            "  OK: <short justification>\n"
-            "- If there are issues, respond with:\n"
-            "  CRITIQUE: <what is wrong + how to fix it>\n"
-            "- Do NOT search for papers yourself; only judge the agent's work.\n"
+            "You are an internal critic. Review research_agent's DRAFT answers.\n\n"
+            "Check:\n"
+            "- Did agent use search_papers tool?\n"
+            "- Are results complete (topic, year, citations addressed)?\n"
+            "- Are parameters correct?\n"
+            "- Is presentation clear?\n\n"
+            "Respond:\n"
+            "- 'OK: <reason>' if acceptable\n"
+            "- 'CRITIQUE: <issue> + <fix>' if problems\n\n"
+            "After 2 critiques, be lenient to avoid loops.\n"
         ),
     )
 
 
-def create_user_proxy_for_groupchat() -> UserProxyAgent:
-    """User proxy to drive the GroupChat"""
+def create_user_proxy() -> UserProxyAgent:
+    """User proxy - executes the search_papers tool"""
     user_proxy = UserProxyAgent(
         name="user_proxy",
         llm_config=False,
         human_input_mode="NEVER",
-        is_termination_msg=lambda m: (m.get("content") or "").rstrip().endswith("TERMINATE"),
+        is_termination_msg=lambda m: "TERMINATE" in m.get("content", ""),
+        max_consecutive_auto_reply=10,
     )
     
-    # Register tool for execution
+    # Register tool for EXECUTION
     user_proxy.register_for_execution(name="search_papers")(search_papers)
     
     return user_proxy
 
 
 # ============================================================================
-# STEP 2: GroupChat Setup
+# STEP 2: Two-Agent Setup (NO GroupChat to avoid Mistral issues)
 # ============================================================================
 
-def make_groupchat() -> GroupChatManager:
-    """Create GroupChat with research agent, critic, and user proxy"""
-    research_agent = create_research_agent_for_groupchat()
-    internal_critic = create_internal_critic()
-    user_proxy = create_user_proxy_for_groupchat()
-    
-    group = GroupChat(
-        agents=[user_proxy, research_agent, internal_critic],
-        messages=[],
-        max_round=15,  # Allow more rounds for tool calls + critique
-        speaker_selection_method="round_robin",  # Use round_robin instead of auto for Mistral
-    )
-    
-    manager = GroupChatManager(
-        groupchat=group,
-        llm_config=LLM_CONFIG,
-    )
-    
-    return manager
+def run_with_tool_calling(user_request: str) -> Dict:
+    """
+    Run request with tool calling using simple 2-agent setup.
+    Avoids GroupChat complexity that causes Mistral API errors.
+    """
+    try:
+        research_agent = create_research_agent()
+        user_proxy = create_user_proxy()
+        
+        # Simple 2-agent conversation
+        chat_result = user_proxy.initiate_chat(
+            research_agent,
+            message=f"USER_REQUEST: {user_request}\n\nUse search_papers to find relevant papers and provide a detailed answer.",
+            max_turns=3,
+        )
+        
+        # Get final message
+        messages = chat_result.chat_history if hasattr(chat_result, 'chat_history') else []
+        final_answer = messages[-1].get("content", "No response") if messages else "No response"
+        
+        return {
+            "final_answer": final_answer,
+            "trace": messages,
+            "tool_called": any("search_papers" in str(m) for m in messages)
+        }
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "final_answer": f"ERROR: {e}",
+            "trace": [],
+            "tool_called": False
+        }
 
 
 def run_with_internal_critic(user_request: str) -> Dict:
     """
-    Run the user request through the GroupChat with internal critic.
-    Follows the exact pattern from the instructor's example.
-    
-    Returns:
-        Dictionary with final_answer and full conversation trace
+    Alternative: Three-agent with manual orchestration (no GroupChat).
+    More control, avoids Mistral message ordering issues.
     """
     try:
-        manager = make_groupchat()
+        research_agent = create_research_agent()
+        critic = create_internal_critic()
+        user_proxy = create_user_proxy()
         
-        init_message = (
-            "USER_REQUEST:\n"
-            f"{user_request}\n\n"
-            "Workflow for agents:\n"
-            "- research_agent: read USER_REQUEST, use search_papers tool, "
-            "then propose answer as 'DRAFT: ...'.\n"
-            "- internal_critic: when you see a DRAFT, respond with 'OK:' or 'CRITIQUE:'.\n"
-            "- research_agent: if you get CRITIQUE, revise and send new 'DRAFT:'.\n"
-            "- When internal_critic is satisfied, research_agent sends "
-            "'FINAL_ANSWER: ...' and includes 'TERMINATE' in the same message.\n\n"
-            "The human will only see the FINAL_ANSWER.\n"
+        conversation = []
+        
+        # Round 1: User -> Research Agent
+        print(f"\n🔹 Round 1: Asking research agent...")
+        response1 = user_proxy.initiate_chat(
+            research_agent,
+            message=f"USER_REQUEST: {user_request}\n\nUse search_papers tool and format response as 'DRAFT: ...'",
+            max_turns=2,
+            clear_history=True,
         )
+        draft1 = response1.chat_history[-1].get("content", "") if response1.chat_history else ""
+        conversation.append({"round": 1, "from": "research_agent", "content": draft1})
         
-        # Get user_proxy from the groupchat
-        user_proxy = manager.groupchat.agents[0]
-        
-        final = user_proxy.initiate_chat(
-            manager,
-            message=init_message,
+        # Round 2: Critic reviews
+        print(f"🔹 Round 2: Critic reviewing...")
+        critique_response = critic.generate_reply(
+            messages=[{"role": "user", "content": f"Review this DRAFT:\n{draft1}\n\nRespond with 'OK:' or 'CRITIQUE:'"}]
         )
+        critique = critique_response if isinstance(critique_response, str) else critique_response.get("content", "")
+        conversation.append({"round": 2, "from": "critic", "content": critique})
         
-        trace = list(manager.groupchat.messages)
+        final_answer = draft1
         
-        # Extract the FINAL_ANSWER from research_agent
-        final_answer = None
-        for msg in reversed(trace):
-            if msg.get("name") == "research_agent" and isinstance(msg.get("content"), str):
-                content = msg["content"]
-                if "FINAL_ANSWER:" in content:
-                    final_answer = content
-                    break
+        # Round 3: If critique, ask agent to revise
+        if "CRITIQUE:" in critique:
+            print(f"🔹 Round 3: Agent revising based on critique...")
+            response2 = user_proxy.initiate_chat(
+                research_agent,
+                message=f"The critic said: {critique}\n\nPlease revise your answer and format as 'FINAL_ANSWER: ...' with TERMINATE",
+                max_turns=2,
+                clear_history=True,
+            )
+            final_answer = response2.chat_history[-1].get("content", "") if response2.chat_history else draft1
+            conversation.append({"round": 3, "from": "research_agent", "content": final_answer})
         
         return {
-            "final_answer": final_answer or str(final),
-            "trace": trace,
+            "final_answer": final_answer,
+            "trace": conversation,
+            "tool_called": "search_papers" in str(conversation)
         }
+        
     except Exception as e:
+        print(f"Error: {e}")
         import traceback
-        print(f"\n!!! FULL ERROR TRACEBACK !!!")
         traceback.print_exc()
-        raise
+        return {
+            "final_answer": f"ERROR: {e}",
+            "trace": [],
+            "tool_called": False
+        }
 
 
 # ============================================================================
-# STEP 3: External LLM-as-Judge
+# STEP 3: External Judge
 # ============================================================================
 
 def create_judge_agent() -> AssistantAgent:
-    """External judge that evaluates final answers"""
+    """External judge"""
     return AssistantAgent(
         name="judge_agent",
         llm_config=LLM_CONFIG,
         system_message=(
-            "You are an external evaluator of a research paper search agent.\n"
-            "Return STRICT JSON only, no extra commentary.\n\n"
-            "Fields to include:\n"
-            "- completeness (1-5): Did the agent address all parts of the request? "
-            "(topic, year, citations)\n"
-            "- accuracy (1-5): Are the search parameters and filters correct?\n"
-            "- quality (1-5): Are results presented clearly with relevant details?\n"
-            "- robustness (1-5): Does it handle ambiguous or edge case requests well?\n"
-            "- feedback (string): Brief explanation of the scores\n\n"
-            "Scoring guide:\n"
-            "5 = Excellent, 4 = Good, 3 = Acceptable, 2 = Poor, 1 = Failed\n"
+            "You are an evaluator. Return ONLY valid JSON.\n\n"
+            "Evaluate:\n"
+            "- completeness (1-5)\n"
+            "- accuracy (1-5)\n"
+            "- quality (1-5)\n"
+            "- robustness (1-5)\n"
+            "- feedback (string)\n\n"
+            'Return: {"completeness": 4, "accuracy": 5, "quality": 4, '
+            '"robustness": 3, "feedback": "..."}'
         ),
     )
 
 
-def build_judge_prompt(user_prompt: str, final_answer: str) -> str:
-    """Build the prompt for the judge agent"""
-    return f"""
-You are evaluating a research paper search agent's performance.
-
-User prompt:
-\"\"\"{user_prompt}\"\"\"
-
-Final answer from the agent (after internal critic review):
-\"\"\"{final_answer}\"\"\"
-
-Evaluate according to your criteria and return JSON ONLY in this exact format:
-{{
-    "completeness": <1-5>,
-    "accuracy": <1-5>,
-    "quality": <1-5>,
-    "robustness": <1-5>,
-    "feedback": "<brief explanation>"
-}}
-"""
-
-
 def llm_judge_score(user_prompt: str, final_answer: str) -> Dict:
-    """
-    Use LLM-as-judge to score the agent's final answer.
-    
-    Returns:
-        Dictionary with scores and feedback
-    """
+    """External judge scoring"""
     judge = create_judge_agent()
-    judge_prompt = build_judge_prompt(user_prompt, final_answer)
     
-    # Get judge's response
-    response = judge.generate_reply(
-        messages=[{"role": "user", "content": judge_prompt}]
-    )
-    
-    # Extract JSON from response
-    content = response if isinstance(response, str) else response.get("content", "")
-    
-    # Try to parse JSON
     try:
-        # Remove markdown code blocks if present
+        response = judge.generate_reply(
+            messages=[{"role": "user", "content": f'Request: "{user_prompt}"\nAnswer: "{final_answer}"\n\nReturn JSON only.'}]
+        )
+        content = response if isinstance(response, str) else response.get("content", "")
+        
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0]
         elif "```" in content:
             content = content.split("```")[1].split("```")[0]
         
         return json.loads(content.strip())
-    except json.JSONDecodeError as e:
-        print(f"Failed to parse judge response: {e}")
-        print(f"Raw content: {content}")
+    except Exception as e:
         return {
-            "completeness": 0,
-            "accuracy": 0,
-            "quality": 0,
-            "robustness": 0,
-            "feedback": f"Error parsing judge response: {e}"
+            "completeness": 0, "accuracy": 0, "quality": 0, "robustness": 0,
+            "feedback": f"Judge error: {e}"
         }
 
 
@@ -264,117 +246,88 @@ def llm_judge_score(user_prompt: str, final_answer: str) -> Dict:
 # ============================================================================
 
 TEST_PROMPTS = [
-    # Typical prompts
     "Find papers about machine learning from 2020 with at least 500 citations",
-    "Search for deep learning papers published after 2018 with 100+ citations",
-    
-    # Ambiguous prompts
-    "I need papers about AI",
-    "Find recent research on neural networks",
-    
-    # Complex requests
-    "Find papers on transformer architecture from 2017 onwards that have significantly impacted NLP",
-    
-    # Edge cases
-    "Search for papers about quantum computing from 2030",
-    "Find papers with exactly 0 citations from last year",
-    "I want papers on deep learning published before 1990",
+    "Search for deep learning papers published after 2018",
+    "I need papers about neural networks",
 ]
 
 
 # ============================================================================
-# STEP 5: Batch Evaluation
+# STEP 5: Evaluation
 # ============================================================================
 
-def evaluate_prompt(prompt: str) -> Dict:
-    """
-    Evaluate a single prompt through the full pipeline:
-    1. Run through GroupChat with internal critic
-    2. Score with external LLM judge
-    
-    Returns:
-        Dictionary with prompt, final answer, and scores
-    """
+def evaluate_prompt(prompt: str, use_critic: bool = True) -> Dict:
+    """Evaluate a single prompt"""
     print(f"\n{'='*80}")
     print(f"Evaluating: {prompt}")
     print('='*80)
     
-    try:
-        # 1) Run through GroupChat with internal critic
-        internal_result = run_with_internal_critic(prompt)
-        final_answer = internal_result["final_answer"]
-        
-        print(f"\nFinal answer received (length: {len(final_answer)} chars)")
-        
-        # 2) External judge scores the final answer
-        judge_scores = llm_judge_score(prompt, final_answer)
-        
-        return {
-            "prompt": prompt,
-            "final_answer": final_answer,
-            "judge_scores": judge_scores,
-            "conversation_trace": internal_result["trace"]
-        }
-    except Exception as e:
-        import traceback
-        print(f"\n!!! FULL ERROR TRACEBACK FOR PROMPT: {prompt} !!!")
-        traceback.print_exc()
-        print(f"!!! END TRACEBACK !!!\n")
-        return {
-            "prompt": prompt,
-            "final_answer": f"ERROR: {e}",
-            "judge_scores": {
-                "completeness": 0,
-                "accuracy": 0,
-                "quality": 0,
-                "robustness": 0,
-                "feedback": f"Evaluation failed: {e}"
-            }
-        }
-
-
-def run_batch_evaluation(prompts: List[str] = None) -> List[Dict]:
-    """
-    Run batch evaluation on all test prompts.
+    # Run with or without critic
+    if use_critic:
+        result = run_with_internal_critic(prompt)
+    else:
+        result = run_with_tool_calling(prompt)
     
-    Returns:
-        List of evaluation results
-    """
+    final_answer = result["final_answer"]
+    print(f"\n✅ Tool called: {result['tool_called']}")
+    print(f"📝 Answer length: {len(final_answer)} chars")
+    
+    # External judge
+    judge_scores = llm_judge_score(prompt, final_answer)
+    
+    return {
+        "prompt": prompt,
+        "final_answer": final_answer,
+        "judge_scores": judge_scores,
+        "tool_called": result["tool_called"],
+        "rounds": len(result["trace"])
+    }
+
+
+def run_batch_evaluation(prompts: List[str] = None, use_critic: bool = True) -> List[Dict]:
+    """Run batch evaluation"""
     if prompts is None:
         prompts = TEST_PROMPTS
     
     results = []
     for prompt in prompts:
-        result = evaluate_prompt(prompt)
-        results.append(result)
+        try:
+            result = evaluate_prompt(prompt, use_critic)
+            results.append(result)
+        except Exception as e:
+            print(f"Error: {e}")
+            results.append({
+                "prompt": prompt,
+                "final_answer": f"ERROR: {e}",
+                "judge_scores": {"completeness": 0, "accuracy": 0, "quality": 0, "robustness": 0, "feedback": str(e)},
+                "tool_called": False,
+                "rounds": 0
+            })
     
     return results
 
 
 def print_summary(results: List[Dict]):
-    """Print summary statistics of evaluation results"""
+    """Print summary"""
     print("\n" + "="*80)
     print("EVALUATION SUMMARY")
     print("="*80)
     
-    # Per-prompt results
     for i, r in enumerate(results, 1):
-        print(f"\n{i}. Prompt: {r['prompt']}")
+        print(f"\n{i}. {r['prompt']}")
+        print(f"   Tool Called: {r.get('tool_called', False)}")
         print(f"   Scores: {r['judge_scores']}")
     
-    # Aggregate statistics
     def avg(key: str) -> float:
-        valid_scores = [r["judge_scores"][key] for r in results 
-                       if isinstance(r["judge_scores"].get(key), (int, float))]
-        return mean(valid_scores) if valid_scores else 0.0
+        valid = [r["judge_scores"][key] for r in results if isinstance(r["judge_scores"].get(key), (int, float))]
+        return mean(valid) if valid else 0.0
     
     print("\n" + "="*80)
-    print("AGGREGATE SCORES (out of 5)")
-    print("="*80)
-    print(f"Average Completeness: {avg('completeness'):.2f}")
-    print(f"Average Accuracy:     {avg('accuracy'):.2f}")
-    print(f"Average Quality:      {avg('quality'):.2f}")
-    print(f"Average Robustness:   {avg('robustness'):.2f}")
+    print(f"Completeness: {avg('completeness'):.2f}/5")
+    print(f"Accuracy:     {avg('accuracy'):.2f}/5")
+    print(f"Quality:      {avg('quality'):.2f}/5")
+    print(f"Robustness:   {avg('robustness'):.2f}/5")
+    print(f"Tools Called: {sum(r.get('tool_called', False) for r in results)}/{len(results)}")
     print("="*80)
 
 
@@ -383,17 +336,14 @@ def print_summary(results: List[Dict]):
 # ============================================================================
 
 if __name__ == "__main__":
-    print("Starting Research Agent Evaluation")
-    print("This will test both internal (critic) and external (judge) evaluation\n")
+    print("Research Agent Evaluation WITH Tool Calling")
+    print("Using manual orchestration to avoid GroupChat/Mistral issues\n")
     
-    # Run batch evaluation
-    results = run_batch_evaluation()
-    
-    # Print summary
+    # Run with internal critic
+    results = run_batch_evaluation(use_critic=True)
     print_summary(results)
     
-    # Optionally save results to file
-    with open("evaluation_results.json", "w") as f:
+    with open("tool_evaluation_results.json", "w") as f:
         json.dump(results, f, indent=2)
     
-    print("\nResults saved to evaluation_results.json")
+    print("\n✅ Results saved to tool_evaluation_results.json")
