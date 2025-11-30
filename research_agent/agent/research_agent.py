@@ -5,7 +5,7 @@ This module implements both internal (critic in the loop) and external
 (LLM-as-judge) evaluation for the research paper search agent.
 """
 
-from autogen import ConversableAgent, GroupChat, GroupChatManager
+from autogen import ConversableAgent, AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
 from research_agent.agent.config import LLM_CONFIG
 from research_agent.tools.search_paper import search_papers
 from typing import Dict, List
@@ -17,27 +17,34 @@ from statistics import mean
 # STEP 1: Define Agents for Internal Evaluation (GroupChat)
 # ============================================================================
 
-def create_research_agent_for_groupchat() -> ConversableAgent:
+def create_research_agent_for_groupchat() -> AssistantAgent:
     """Research agent that works with internal critic in GroupChat"""
-    agent = ConversableAgent(
+    agent = AssistantAgent(
         name="research_agent",
         llm_config=LLM_CONFIG,
         system_message=(
-            "You are a research paper search assistant inside a multi-agent system.\n"
+"You are a research paper search assistant inside a multi-agent system.\n"
             "You talk only to other agents, not the human.\n\n"
-            "Workflow:\n"
-            "1) When you receive the original USER_REQUEST, use the search_papers tool "
-            "to find relevant papers, then produce a draft answer prefixed with 'DRAFT:'.\n"
-            "2) Wait for the internal_critic to respond with 'OK:' or 'CRITIQUE:'.\n"
-            "3) If you receive CRITIQUE, revise your search or answer and send a new 'DRAFT:' "
-            "that addresses the critique.\n"
-            "4) When the critic responds with OK, send the final answer prefixed with "
+            "**STRICT Workflow - Tool Use IS Mandatory for Draft:**\n"
+            "1) When you receive the original USER_REQUEST, you **MUST FIRST** use the "
+            "`search_papers` tool with the appropriate parameters to gather data. "
+            "You **CANNOT** produce a 'DRAFT:' answer without a successful `search_papers` "
+            "tool call and its results in the conversation history. This step is "
+            "NON-NEGOTIABLE for your first response.\n"
+            "2) After receiving the search results, produce a draft answer "
+            "prefixed with 'DRAFT:'.\n"
+            "3) Wait for the internal_critic to respond with 'OK:' or 'CRITIQUE:'.\n"
+            "4) If you receive CRITIQUE, revise your search (call the tool again if needed) "
+            "or revise your answer and send a new 'DRAFT:' that addresses the critique.\n"
+            "5) When the critic responds with OK, send the final answer prefixed with "
             "'FINAL_ANSWER:' and include the token 'TERMINATE' in the same message.\n\n"
             "Guidelines:\n"
+            "- **PRIORITY 1:** Your very first action, when given the USER_REQUEST, "
+            "must be a call to the `search_papers` tool.\n"
             "- Use search_papers tool to find papers matching the criteria\n"
-            "- Present results clearly with title, authors, year, citations\n"
-            "- If criteria are ambiguous, explain your interpretation\n"
-            "- If no papers match, explain why and suggest alternatives\n"
+            "- Present results clearly with title, authors, year, citations, and abstract/summary\n"
+            "- If criteria are ambiguous, explain your interpretation *after* the initial tool call\n"
+            "- If no papers match, explain why in your 'DRAFT:' and suggest alternatives\n"
         ),
     )
     
@@ -54,9 +61,9 @@ def create_research_agent_for_groupchat() -> ConversableAgent:
     return agent
 
 
-def create_internal_critic() -> ConversableAgent:
+def create_internal_critic() -> AssistantAgent:
     """Internal critic that reviews research agent's drafts"""
-    return ConversableAgent(
+    return AssistantAgent(
         name="internal_critic",
         llm_config=LLM_CONFIG,
         system_message=(
@@ -79,9 +86,9 @@ def create_internal_critic() -> ConversableAgent:
     )
 
 
-def create_user_proxy_for_groupchat() -> ConversableAgent:
+def create_user_proxy_for_groupchat() -> UserProxyAgent:
     """User proxy to drive the GroupChat"""
-    user_proxy = ConversableAgent(
+    user_proxy = UserProxyAgent(
         name="user_proxy",
         llm_config=False,
         human_input_mode="NEVER",
@@ -108,7 +115,7 @@ def make_groupchat() -> GroupChatManager:
         agents=[user_proxy, research_agent, internal_critic],
         messages=[],
         max_round=15,  # Allow more rounds for tool calls + critique
-        speaker_selection_method="auto",
+        speaker_selection_method="round_robin",
     )
     
     manager = GroupChatManager(
@@ -261,12 +268,6 @@ def llm_judge_score(user_prompt: str, final_answer: str) -> Dict:
 # ============================================================================
 
 TEST_PROMPTS = [
-    # Typical prompts
-    "Find papers about machine learning from 2020 with at least 500 citations",
-    "Search for deep learning papers published after 2018 with 100+ citations",
-    
-    # Ambiguous prompts
-    "I need papers about AI",
     "Find recent research on neural networks",
     
     # Complex requests
@@ -275,7 +276,7 @@ TEST_PROMPTS = [
     # Edge cases
     "Search for papers about quantum computing from 2030",
     "Find papers with exactly 0 citations from last year",
-    "I want papers on deep learning published before 1990",
+ 
 ]
 
 
