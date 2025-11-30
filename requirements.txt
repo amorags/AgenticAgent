@@ -4,3 +4,4 @@ mistralai==1.2.3
 ollama==0.3.3
 fix-busted-json==0.0.18
 python-dotenv>=1.0.0
+requests>=2.31.0
