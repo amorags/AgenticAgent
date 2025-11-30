@@ -5,7 +5,7 @@ This module implements both internal (critic in the loop) and external
 (LLM-as-judge) evaluation for the research paper search agent.
 """
 
-from autogen import ConversableAgent, GroupChat, GroupChatManager
+from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
 from research_agent.agent.config import LLM_CONFIG
 from research_agent.tools.search_paper import search_papers
 from typing import Dict, List
@@ -17,9 +17,9 @@ from statistics import mean
 # STEP 1: Define Agents for Internal Evaluation (GroupChat)
 # ============================================================================
 
-def create_research_agent_for_groupchat() -> ConversableAgent:
+def create_research_agent_for_groupchat() -> AssistantAgent:
     """Research agent that works with internal critic in GroupChat"""
-    agent = ConversableAgent(
+    agent = AssistantAgent(
         name="research_agent",
         llm_config=LLM_CONFIG,
         system_message=(
@@ -54,9 +54,9 @@ def create_research_agent_for_groupchat() -> ConversableAgent:
     return agent
 
 
-def create_internal_critic() -> ConversableAgent:
+def create_internal_critic() -> AssistantAgent:
     """Internal critic that reviews research agent's drafts"""
-    return ConversableAgent(
+    return AssistantAgent(
         name="internal_critic",
         llm_config=LLM_CONFIG,
         system_message=(
@@ -79,9 +79,9 @@ def create_internal_critic() -> ConversableAgent:
     )
 
 
-def create_user_proxy_for_groupchat() -> ConversableAgent:
+def create_user_proxy_for_groupchat() -> UserProxyAgent:
     """User proxy to drive the GroupChat"""
-    user_proxy = ConversableAgent(
+    user_proxy = UserProxyAgent(
         name="user_proxy",
         llm_config=False,
         human_input_mode="NEVER",
@@ -108,7 +108,7 @@ def make_groupchat() -> GroupChatManager:
         agents=[user_proxy, research_agent, internal_critic],
         messages=[],
         max_round=15,  # Allow more rounds for tool calls + critique
-        speaker_selection_method="auto",
+        speaker_selection_method="round_robin",  # Use round_robin instead of auto for Mistral
     )
     
     manager = GroupChatManager(
@@ -122,13 +122,13 @@ def make_groupchat() -> GroupChatManager:
 def run_with_internal_critic(user_request: str) -> Dict:
     """
     Run the user request through the GroupChat with internal critic.
+    Follows the exact pattern from the instructor's example.
     
     Returns:
         Dictionary with final_answer and full conversation trace
     """
     try:
         manager = make_groupchat()
-        user_proxy = manager.groupchat.agents[0]  # Get the user_proxy from groupchat
         
         init_message = (
             "USER_REQUEST:\n"
@@ -142,6 +142,9 @@ def run_with_internal_critic(user_request: str) -> Dict:
             "'FINAL_ANSWER: ...' and includes 'TERMINATE' in the same message.\n\n"
             "The human will only see the FINAL_ANSWER.\n"
         )
+        
+        # Get user_proxy from the groupchat
+        user_proxy = manager.groupchat.agents[0]
         
         final = user_proxy.initiate_chat(
             manager,
@@ -174,9 +177,9 @@ def run_with_internal_critic(user_request: str) -> Dict:
 # STEP 3: External LLM-as-Judge
 # ============================================================================
 
-def create_judge_agent() -> ConversableAgent:
+def create_judge_agent() -> AssistantAgent:
     """External judge that evaluates final answers"""
-    return ConversableAgent(
+    return AssistantAgent(
         name="judge_agent",
         llm_config=LLM_CONFIG,
         system_message=(
@@ -342,22 +345,8 @@ def run_batch_evaluation(prompts: List[str] = None) -> List[Dict]:
     
     results = []
     for prompt in prompts:
-        try:
-            result = evaluate_prompt(prompt)
-            results.append(result)
-        except Exception as e:
-            print(f"Error evaluating prompt '{prompt}': {e}")
-            results.append({
-                "prompt": prompt,
-                "final_answer": f"ERROR: {e}",
-                "judge_scores": {
-                    "completeness": 0,
-                    "accuracy": 0,
-                    "quality": 0,
-                    "robustness": 0,
-                    "feedback": f"Evaluation failed: {e}"
-                }
-            })
+        result = evaluate_prompt(prompt)
+        results.append(result)
     
     return results
 
