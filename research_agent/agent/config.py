@@ -24,7 +24,7 @@ LLM_CONFIG = {
             "temperature": 0.0,
             "seed": 42,
             "stream": False,
-            "native_tool_calls": False,
+            "native_tool_calls": True,
             "cache_seed": None,
         }
     ]
