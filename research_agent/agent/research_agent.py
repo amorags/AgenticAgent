@@ -1,5 +1,7 @@
 from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
+# NOTE: Assuming research_agent.agent.config.LLM_CONFIG is available
 from research_agent.agent.config import LLM_CONFIG
+# NOTE: Assuming research_agent.tools.search_paper.search_papers is available
 from research_agent.tools.search_paper import search_papers
 from typing import List, Dict
 import json
@@ -10,7 +12,7 @@ from statistics import mean
 # ============================================================================
 
 paper_agent = AssistantAgent(
-    name="research_agent",
+    name="paper_agent",
     llm_config={
         **LLM_CONFIG,
         "functions": [
@@ -53,16 +55,16 @@ paper_agent = AssistantAgent(
         "**Process:**\n"
         "1. Call search_papers with user's criteria\n"
         "2. Wait for real results from tool execution\n"
-        "3. Write 'DRAFT:' with TOP 5 formatted results (even if you got more)\n"
+        "3. Write 'DRAFT:' or 'NEW DRAFT:' with TOP 5 formatted results (even if you got more)\n"
         "4. Wait for and respond to critic feedback\n"
         "5. When critic says 'OK:', write 'FINAL_ANSWER:' with the approved content and 'TERMINATE'\n\n"
         "**Example Format:**\n"
         "DRAFT:\n"
         "Here are 5 highly-cited papers on [topic]:\n\n"
         "1. **Title Here**\n"
-        "   - Authors: First Author, Second Author, Third Author et al.\n"
-        "   - Year: 2020 | Citations: 5000\n"
-        "   - URL: https://...\n"
+        "   - Authors: First Author, Second Author, Third Author et al.\n"
+        "   - Year: 2020 | Citations: 5000\n"
+        "   - URL: https://...\n"
     ),
 )
 
@@ -79,6 +81,8 @@ paper_agent.register_for_llm(
     )
 )(search_papers)
 
+# internal_critic: Defined as UserProxyAgent for robust flow control
+# Removed the duplicate definition that was further down.
 internal_critic = AssistantAgent(
     name="internal_critic",
     llm_config=LLM_CONFIG,
@@ -105,6 +109,7 @@ user_proxy = UserProxyAgent(
     name="user_proxy",
     llm_config=False,
     human_input_mode="NEVER",
+    # Termination is strictly when 'FINAL_ANSWER:' + 'TERMINATE' is received.
     is_termination_msg=lambda m: "TERMINATE" in m.get("content", ""),
     code_execution_config=False,
 )
@@ -115,35 +120,56 @@ user_proxy.register_for_execution(name="search_papers")(search_papers)
 # ============================================================================
 
 def custom_speaker_selection(last_speaker, groupchat):
-    """Custom logic to handle tool calls and ensure proper flow"""
+    """
+    Defensive logic to enforce the Tool Call -> Draft -> Critique flow, 
+    using the user_proxy as a 'sanitizer' only when a DRAFT is detected.
+    """
     messages = groupchat.messages
     
-    if not messages:
+    if not messages or last_speaker is None:
+        # 0. Initial check: Start the conversation
         return paper_agent
-    
+
     last_msg = messages[-1]
-    last_name = last_msg.get("name", "")
     last_content = last_msg.get("content", "")
-    
-    # After user_proxy sends tool result, research_agent should respond
-    if last_name == "user_proxy" and "***** Response from calling tool" in str(last_content):
-        return paper_agent
-    
-    # After research_agent posts DRAFT, internal_critic should review
-    if last_name == "research_agent" and "DRAFT:" in str(last_content):
-        return internal_critic
-    
-    # After internal_critic gives feedback, research_agent should respond
-    if last_name == "internal_critic":
-        return paper_agent
-    
-    # After research_agent makes tool call, user_proxy executes
-    if last_name == "research_agent" and "tool_calls" in str(last_msg):
+
+    # ===================================================================
+    # 1. TOOL CALL FLOW: paper_agent <-> user_proxy
+    # ===================================================================
+
+    # A. paper_agent calls tool -> user_proxy executes
+    if last_speaker is paper_agent and last_msg.get("tool_calls"):
         return user_proxy
     
-    # Default: research_agent starts
-    return paper_agent
+    # B. user_proxy returns tool result -> paper_agent processes result
+    if last_speaker is user_proxy and last_msg.get("role") == "tool":
+        return paper_agent
+    
+    # ===================================================================
+    # 2. CRITIQUE FLOW: paper_agent -> user_proxy -> internal_critic -> paper_agent
+    # ===================================================================
+    
+    # C. paper_agent sends DRAFT/Revision -> user_proxy (Sanitizer)
+    if last_speaker is paper_agent and ("DRAFT:" in last_content or "NEW DRAFT:" in last_content):
+        return user_proxy
+        
+    # D. user_proxy (Sanitizer) -> internal_critic (Reviewer)
+    # If user_proxy spoke, and it wasn't a tool result (handled by B), 
+    # it must be the sanitizer turn, so next is the critic.
+    if last_speaker is user_proxy and last_msg.get("role") != "tool":
+        return internal_critic
 
+    # E. internal_critic (Critique) -> paper_agent (Reviser)
+    if last_speaker is internal_critic:
+        return paper_agent
+
+    # ===================================================================
+    # 3. FALLBACK
+    # ===================================================================
+
+    # Default to paper_agent if the flow is broken or starting
+    return paper_agent
+    
 # ============================================================================
 # STEP 3: Create GroupChat
 # ============================================================================
@@ -168,10 +194,10 @@ def run_with_internal_critic(user_request: str) -> Dict:
     init_message = (
         f"USER_REQUEST:\n{user_request}\n\n"
         "Workflow:\n"
-        "1. research_agent: Call search_papers, then write 'DRAFT:' with TOP 5 results\n"
+        "1. paper_agent: Call search_papers, then write 'DRAFT:' with TOP 5 results\n"
         "2. internal_critic: Review the DRAFT and respond 'OK:' or 'CRITIQUE:'\n"
-        "3. research_agent: If CRITIQUE, revise and send 'NEW DRAFT:'\n"
-        "4. When internal_critic says 'OK:', research_agent sends 'FINAL_ANSWER:' + 'TERMINATE'\n"
+        "3. paper_agent: If CRITIQUE, revise and send 'NEW DRAFT:'\n"
+        "4. When internal_critic says 'OK:', paper_agent sends 'FINAL_ANSWER:' + 'TERMINATE'\n"
     )
 
     try:
@@ -182,26 +208,39 @@ def run_with_internal_critic(user_request: str) -> Dict:
         trace = list(manager.groupchat.messages) if hasattr(manager, 'groupchat') else []
         final = None
 
-    # Extract FINAL_ANSWER
+    # Extract FINAL_ANSWER (MUST contain "TERMINATE")
     final_answer = None
     for msg in reversed(trace):
-        if msg.get("name") == "research_agent":
+        if msg.get("name") == "paper_agent":
             content = msg.get("content", "")
-            if isinstance(content, str) and "FINAL_ANSWER:" in content:
+            # Check for both FINAL_ANSWER: and TERMINATE to ensure successful completion
+            if isinstance(content, str) and "FINAL_ANSWER:" in content and "TERMINATE" in content:
                 final_answer = content
                 break
     
-    # Fallback: if no FINAL_ANSWER but we have a DRAFT
+    # NEW Fallback: If chat did not complete successfully, find the last draft 
+    # and wrap it in an error message for diagnostic scoring.
     if not final_answer:
+        last_draft = None
         for msg in reversed(trace):
-            if msg.get("name") == "research_agent":
+            if msg.get("name") == "paper_agent":
                 content = msg.get("content", "")
-                if isinstance(content, str) and "DRAFT:" in content:
-                    final_answer = content
+                if isinstance(content, str) and ("DRAFT:" in content or "NEW DRAFT:" in content):
+                    last_draft = content
                     break
+        
+        if last_draft:
+            # Signal to the judge that the run failed at the end of a draft cycle.
+            final_answer = (
+                "ERROR: Chat terminated prematurely before critic approval. "
+                "Scoring the last incomplete DRAFT:\n\n"
+            ) + last_draft
+        else:
+            final_answer = "ERROR: No response or final answer generated."
+
 
     return {
-        "final_answer": final_answer or "ERROR: No response generated",
+        "final_answer": final_answer,
         "trace": trace,
     }
 
@@ -219,11 +258,11 @@ def create_judge_agent() -> AssistantAgent:
             "2) ANSWER – the research agent's final response\n\n"
             "Evaluate the ANSWER and return ONLY valid JSON:\n"
             "{\n"
-            '  "completeness": 1-5,  // How fully ANSWER addresses PROMPT\n'
-            '  "accuracy": 1-5,      // Factual correctness, proper citations\n'
-            '  "quality": 1-5,       // Clarity, structure, readability\n'
-            '  "robustness": 1-5,    // Proper tool usage, edge case handling\n'
-            '  "feedback": "string"  // Concise explanation\n'
+            '  "completeness": 1-5,  // How fully ANSWER addresses PROMPT\n'
+            '  "accuracy": 1-5,      // Factual correctness, proper citations\n'
+            '  "quality": 1-5,       // Clarity, structure, readability\n'
+            '  "robustness": 1-5,    // Proper tool usage, edge case handling\n'
+            '  "feedback": "string"  // Concise explanation\n'
             "}\n\n"
             "Requirements:\n"
             "- Output ONLY valid JSON, nothing else\n"
@@ -250,6 +289,7 @@ def llm_judge_score(user_prompt: str, final_answer: str) -> Dict:
     )
     
     try:
+        # Note: max_turns=1 is correct for a single-turn evaluation
         judge_proxy.initiate_chat(judge, message=eval_prompt, max_turns=1)
         last_msg = judge.last_message()
         content = last_msg.get("content", "{}") if last_msg else "{}"
@@ -272,7 +312,7 @@ def llm_judge_score(user_prompt: str, final_answer: str) -> Dict:
             "accuracy": 0,
             "quality": 0,
             "robustness": 0,
-            "feedback": f"JSON parse error: {e}"
+            "feedback": f"JSON parse error: {e}. Raw content: {content}"
         }
     except Exception as e:
         return {
@@ -306,7 +346,7 @@ def print_summary(results: List[Dict]):
 
     for i, r in enumerate(results, 1):
         print(f"\n{i}. {r['prompt']}")
-        print(f"   Scores: {r['judge_scores']}")
+        print(f"   Scores: {r['judge_scores']}")
 
     def avg(key: str) -> float:
         valid = [r["judge_scores"][key] for r in results 
@@ -315,9 +355,9 @@ def print_summary(results: List[Dict]):
 
     print("\n" + "="*80)
     print(f"Avg Completeness: {avg('completeness'):.2f}/5")
-    print(f"Avg Accuracy:     {avg('accuracy'):.2f}/5")
-    print(f"Avg Quality:      {avg('quality'):.2f}/5")
-    print(f"Avg Robustness:   {avg('robustness'):.2f}/5")
+    print(f"Avg Accuracy:     {avg('accuracy'):.2f}/5")
+    print(f"Avg Quality:      {avg('quality'):.2f}/5")
+    print(f"Avg Robustness:   {avg('robustness'):.2f}/5")
     print("="*80)
 
 # ============================================================================
