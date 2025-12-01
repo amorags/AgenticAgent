@@ -11,19 +11,58 @@ from statistics import mean
 
 paper_agent = AssistantAgent(
     name="research_agent",
-    llm_config=LLM_CONFIG,
+    llm_config={
+        **LLM_CONFIG,
+        "functions": [
+            {
+                "name": "search_papers",
+                "description": "Search for academic papers from Semantic Scholar",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Research topic to search for"
+                        },
+                        "min_citations": {
+                            "type": "integer",
+                            "description": "Minimum citation count"
+                        },
+                        "year": {
+                            "type": "integer",
+                            "description": "Publication year (optional)"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max results (default 10)"
+                        }
+                    },
+                    "required": ["topic"]
+                }
+            }
+        ]
+    },
     system_message=(
-        "You are a research paper search assistant inside a multi-agent system.\n"
-        "You only talk to other agents, never the human.\n"
-        "Workflow:\n"
-        "1) Read USER_REQUEST carefully.\n"
-        "2) ALWAYS use the search_papers tool to find papers, Always Always Always. Do not invent papers. always include links to the paper\n"
-        "3) Format your first answer as 'FIRST DRAFT:' for the internal critic to review.\n"
-        "4) You must output your parameters chosen for the search_paper tool call as part of your DRAFT \n"
-        "5) YOU absolutely have to state how many papaers you found in total in the tool call \n"
-        "6) If internal_critic has any critique, you must adhere to it, but you can ask for clarification if you disagree \n"
-        "7) If internal_critic says OK, send 'FINAL_ANSWER:' including 'TERMINATE'.\n"
-
+        "You are a research paper search assistant.\n\n"
+        "**STRICT REQUIREMENTS:**\n"
+        "1. You MUST call search_papers function BEFORE writing any draft\n"
+        "2. Never make up papers - only use real search results\n"
+        "3. After receiving search results, write a CONCISE draft with MAX 5 papers\n"
+        "4. For authors: show ONLY first 3 authors, then add 'et al.' if more exist\n"
+        "5. Format each paper clearly with: Title, First 3 Authors (et al.), Year, Citations, URL\n\n"
+        "**Process:**\n"
+        "1. Call search_papers with user's criteria\n"
+        "2. Wait for real results from tool execution\n"
+        "3. Write 'DRAFT:' with TOP 5 formatted results (even if you got more)\n"
+        "4. Wait for and respond to critic feedback\n"
+        "5. When critic says 'OK:', write 'FINAL_ANSWER:' with the approved content and 'TERMINATE'\n\n"
+        "**Example Format:**\n"
+        "DRAFT:\n"
+        "Here are 5 highly-cited papers on [topic]:\n\n"
+        "1. **Title Here**\n"
+        "   - Authors: First Author, Second Author, Third Author et al.\n"
+        "   - Year: 2020 | Citations: 5000\n"
+        "   - URL: https://...\n"
     ),
 )
 
@@ -44,15 +83,21 @@ internal_critic = AssistantAgent(
     name="internal_critic",
     llm_config=LLM_CONFIG,
     system_message=(
-        "You are an internal critic reviewing research_agent's DRAFTs.\n"
-        "Evaluate completeness, accuracy, tool usage, and clarity. \n"
-        "If a paper is very relevant but outside year scope you are allowed to be lenient "
-        "Put high value in proper paramater usage and make sure all links are relevant \n"
-        "Respond ONLY with:\n"
-        "- OK: <short justification>\n"
-        "- CRITIQUE: <issue + smallest fix>\n"
-        "Do NOT produce a final answer. \n"
-        "Never use code blocks ´´´´´´"
+        "You are an internal critic reviewing research_agent's DRAFTs.\n\n"
+        "**YOUR ROLE:**\n"
+        "- ONLY respond when you see a message containing 'DRAFT:'\n"
+        "- IGNORE tool calls and tool results\n"
+        "- Provide immediate feedback on drafts\n\n"
+        "**Evaluation Criteria:**\n"
+        "1. Are there exactly 5 or fewer papers listed?\n"
+        "2. Do all papers meet the citation requirement (if specified)?\n"
+        "3. Are author lists concise (max 3 authors shown + et al.)?\n"
+        "4. Are URLs provided for each paper?\n"
+        "5. Is the format clear and consistent?\n\n"
+        "**Response Format:**\n"
+        "- If acceptable: 'OK: [brief reason]'\n"
+        "- If issues found: 'CRITIQUE: [specific issue]'\n\n"
+        "Be concise. Approve good drafts quickly.\n"
     ),
 )
 
@@ -61,25 +106,60 @@ user_proxy = UserProxyAgent(
     llm_config=False,
     human_input_mode="NEVER",
     is_termination_msg=lambda m: "TERMINATE" in m.get("content", ""),
+    code_execution_config=False,
 )
 user_proxy.register_for_execution(name="search_papers")(search_papers)
 
 # ============================================================================
-# STEP 2: Create GroupChat
+# STEP 2: Custom Speaker Selection
+# ============================================================================
+
+def custom_speaker_selection(last_speaker, groupchat):
+    """Custom logic to handle tool calls and ensure proper flow"""
+    messages = groupchat.messages
+    
+    if not messages:
+        return paper_agent
+    
+    last_msg = messages[-1]
+    last_name = last_msg.get("name", "")
+    last_content = last_msg.get("content", "")
+    
+    # After user_proxy sends tool result, research_agent should respond
+    if last_name == "user_proxy" and "***** Response from calling tool" in str(last_content):
+        return paper_agent
+    
+    # After research_agent posts DRAFT, internal_critic should review
+    if last_name == "research_agent" and "DRAFT:" in str(last_content):
+        return internal_critic
+    
+    # After internal_critic gives feedback, research_agent should respond
+    if last_name == "internal_critic":
+        return paper_agent
+    
+    # After research_agent makes tool call, user_proxy executes
+    if last_name == "research_agent" and "tool_calls" in str(last_msg):
+        return user_proxy
+    
+    # Default: research_agent starts
+    return paper_agent
+
+# ============================================================================
+# STEP 3: Create GroupChat
 # ============================================================================
 
 def make_groupchat() -> GroupChatManager:
     group = GroupChat(
         agents=[user_proxy, paper_agent, internal_critic],
         messages=[],
-        max_round=12,
-        speaker_selection_method="round_robin",
+        max_round=25,
+        speaker_selection_method=custom_speaker_selection,
     )
     manager = GroupChatManager(groupchat=group, llm_config=LLM_CONFIG)
     return manager
 
 # ============================================================================
-# STEP 3: Run User Request Through GroupChat
+# STEP 4: Run User Request Through GroupChat
 # ============================================================================
 
 def run_with_internal_critic(user_request: str) -> Dict:
@@ -87,36 +167,46 @@ def run_with_internal_critic(user_request: str) -> Dict:
 
     init_message = (
         f"USER_REQUEST:\n{user_request}\n\n"
-        "Workflow for agents:\n"
-        "- paper_agent: read USER_REQUEST and propose an answer as 'FIRST DRAFT: ...'.\n"
-        "- internal_critic: when you see a any type of DRAFT, respond with 'OK:' or 'CRITIQUE:'\n"
-        "- paper_agent: if you get CRITIQUE, revise and send a new 'NEW DRAFT:'\n"
-        "- When and ONLY when the internal_critic is satisfied, indicated by saying OK, paper_agent sends \n"
-        "'FINAL_ANSWER: ...' and also includes 'TERMINATE' in the same message.\n"
-        "The human will only see the FINAL_ANSWER.\n"
+        "Workflow:\n"
+        "1. research_agent: Call search_papers, then write 'DRAFT:' with TOP 5 results\n"
+        "2. internal_critic: Review the DRAFT and respond 'OK:' or 'CRITIQUE:'\n"
+        "3. research_agent: If CRITIQUE, revise and send 'NEW DRAFT:'\n"
+        "4. When internal_critic says 'OK:', research_agent sends 'FINAL_ANSWER:' + 'TERMINATE'\n"
     )
 
-    # Send raw string message to manager
-    final = user_proxy.initiate_chat(manager, message=init_message, role_override="assistant")
+    try:
+        final = user_proxy.initiate_chat(manager, message=init_message)
+        trace = list(manager.groupchat.messages)
+    except Exception as e:
+        print(f"Chat error: {e}")
+        trace = list(manager.groupchat.messages) if hasattr(manager, 'groupchat') else []
+        final = None
 
-    trace = list(manager.groupchat.messages)
-
-    # Extract FINAL_ANSWER from paper_agent
+    # Extract FINAL_ANSWER
     final_answer = None
     for msg in reversed(trace):
-        if msg.get("name") == "research_agent" and isinstance(msg.get("content"), str):
-            content = msg["content"]
-            if "FINAL_ANSWER:" in content:
+        if msg.get("name") == "research_agent":
+            content = msg.get("content", "")
+            if isinstance(content, str) and "FINAL_ANSWER:" in content:
                 final_answer = content
                 break
+    
+    # Fallback: if no FINAL_ANSWER but we have a DRAFT
+    if not final_answer:
+        for msg in reversed(trace):
+            if msg.get("name") == "research_agent":
+                content = msg.get("content", "")
+                if isinstance(content, str) and "DRAFT:" in content:
+                    final_answer = content
+                    break
 
     return {
-        "final_answer": final_answer or str(final),
+        "final_answer": final_answer or "ERROR: No response generated",
         "trace": trace,
     }
 
 # ============================================================================
-# STEP 4: External Judge
+# STEP 5: External Judge
 # ============================================================================
 
 def create_judge_agent() -> AssistantAgent:
@@ -124,62 +214,77 @@ def create_judge_agent() -> AssistantAgent:
         name="judge_agent",
         llm_config=LLM_CONFIG,
         system_message=(
-            "You are a strict evaluation agent. You will be given two items:\n"
-            "1) PROMPT – the user's original request.\n"
-            "2) ANSWER – the research agent's final response.\n\n"
-            "Your task is to evaluate the ANSWER objectively based on the PROMPT, and return STRICT JSON only.\n"
-            "Fields to return:\n"
-            "- completeness (int, 1-5): how fully the ANSWER addresses the PROMPT\n"
-            "- accuracy (int, 1-5): factual correctness, including proper citations and paper details\n"
-            "- quality (int, 1-5): clarity, structure, and readability of the ANSWER\n"
-            "- robustness (int, 1-5): proper tool usage, handling of edge cases, and consistency\n"
-            "- feedback (string): concise explanation of your scores or issues\n\n"
+            "You are a strict evaluation agent. You will be given:\n"
+            "1) PROMPT – the user's original request\n"
+            "2) ANSWER – the research agent's final response\n\n"
+            "Evaluate the ANSWER and return ONLY valid JSON:\n"
+            "{\n"
+            '  "completeness": 1-5,  // How fully ANSWER addresses PROMPT\n'
+            '  "accuracy": 1-5,      // Factual correctness, proper citations\n'
+            '  "quality": 1-5,       // Clarity, structure, readability\n'
+            '  "robustness": 1-5,    // Proper tool usage, edge case handling\n'
+            '  "feedback": "string"  // Concise explanation\n'
+            "}\n\n"
             "Requirements:\n"
-            "- Do not output anything except valid JSON.\n"
-            "- Use integers 1-5 for scoring, never decimals.\n"
-            "- Be strict: if information is missing, inaccurate, or misformatted, lower the score.\n"
-            "- Do not make up papers or citations.\n"
-            "- Avoid extra commentary or apologies.\n"
-            "- Example output format:\n"
-            '{"completeness": 4, "accuracy": 5, "quality": 4, "robustness": 3, "feedback": "Some papers missing links."}'
+            "- Output ONLY valid JSON, nothing else\n"
+            "- Use integers 1-5, never decimals\n"
+            "- Be strict: missing info, inaccuracies, or poor format = lower score\n"
+            "- Check: Are papers real? Citations accurate? Format clean? Author lists concise?\n"
         ),
     )
 
 def llm_judge_score(user_prompt: str, final_answer: str) -> Dict:
+    """Evaluate using a fresh agent"""
     judge = create_judge_agent()
-    response = judge.generate_reply(
-        messages=[{
-            "role": "user",
-            "content": f'PROMPT: "{user_prompt}"\nANSWER: "{final_answer}"\nReturn JSON only.'
-        }]
+    judge_proxy = UserProxyAgent(
+        name="judge_proxy",
+        llm_config=False,
+        human_input_mode="NEVER",
+        max_consecutive_auto_reply=0
     )
-    content = response.get("content") if isinstance(response, dict) else str(response)
-
+    
+    eval_prompt = (
+        f'PROMPT: "{user_prompt}"\n\n'
+        f'ANSWER: "{final_answer}"\n\n'
+        f'Return JSON only: completeness, accuracy, quality, robustness, feedback'
+    )
+    
     try:
-        return json.loads(content.strip())
+        judge_proxy.initiate_chat(judge, message=eval_prompt, max_turns=1)
+        last_msg = judge.last_message()
+        content = last_msg.get("content", "{}") if last_msg else "{}"
+        
+        # Clean potential markdown
+        content = content.strip()
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        return json.loads(content)
+        
+    except json.JSONDecodeError as e:
+        return {
+            "completeness": 0,
+            "accuracy": 0,
+            "quality": 0,
+            "robustness": 0,
+            "feedback": f"JSON parse error: {e}"
+        }
     except Exception as e:
         return {
             "completeness": 0,
             "accuracy": 0,
             "quality": 0,
             "robustness": 0,
-            "feedback": f"Judge error: {e}"
+            "feedback": f"API error occurred: {str(e)}"
         }
 
 # ============================================================================
-# STEP 5: Test Prompts
-# ============================================================================
-
-TEST_PROMPTS: List[str] = [
-    "Find papers about machine learning from 2020 with at least 500 citations",
-    "Search for deep learning papers published after 2018",
-    "I need papers about neural networks",
-    "Find research on reinforcement learning with 1000+ citations",
-    "Recent NLP papers from 2022 with at least 200 citations",
-]
-
-# ============================================================================
-# STEP 6: Evaluation & Summary
+# STEP 6: Evaluation
 # ============================================================================
 
 def evaluate_prompt(prompt: str) -> Dict:
@@ -194,24 +299,6 @@ def evaluate_prompt(prompt: str) -> Dict:
         "rounds": len(internal_result["trace"]),
     }
 
-def run_batch_evaluation(prompts: List[str] = None) -> List[Dict]:
-    if prompts is None:
-        prompts = TEST_PROMPTS
-
-    results = []
-    for p in prompts:
-        try:
-            result = evaluate_prompt(p)
-            results.append(result)
-        except Exception as e:
-            results.append({
-                "prompt": p,
-                "final_answer": f"ERROR: {e}",
-                "judge_scores": {"completeness": 0, "accuracy": 0, "quality": 0, "robustness": 0, "feedback": str(e)},
-                "rounds": 0
-            })
-    return results
-
 def print_summary(results: List[Dict]):
     print("\n" + "="*80)
     print("EVALUATION SUMMARY")
@@ -222,7 +309,8 @@ def print_summary(results: List[Dict]):
         print(f"   Scores: {r['judge_scores']}")
 
     def avg(key: str) -> float:
-        valid = [r["judge_scores"][key] for r in results if isinstance(r["judge_scores"].get(key), (int, float))]
+        valid = [r["judge_scores"][key] for r in results 
+                 if isinstance(r["judge_scores"].get(key), (int, float))]
         return mean(valid) if valid else 0.0
 
     print("\n" + "="*80)
@@ -238,10 +326,26 @@ def print_summary(results: List[Dict]):
 
 if __name__ == "__main__":
     print("Research Agent Evaluation WITH GroupChat + Internal Critic\n")
-    results = run_batch_evaluation()
-    print_summary(results)
-
-    with open("tool_evaluation_results.json", "w") as f:
-        json.dump(results, f, indent=2)
-
-    print("\n✅ Results saved to tool_evaluation_results.json")
+    
+    # Get user input
+    print("Enter your research request (or press Enter for default):")
+    user_input = input("> ").strip()
+    
+    if not user_input:
+        user_input = "Find research on reinforcement learning with 1000+ citations"
+        print(f"Using default: {user_input}\n")
+    
+    # Run single evaluation
+    try:
+        result = evaluate_prompt(user_input)
+        print_summary([result])
+        
+        with open("tool_evaluation_results.json", "w") as f:
+            json.dump([result], f, indent=2)
+        
+        print("\n✅ Results saved to tool_evaluation_results.json")
+        
+    except Exception as e:
+        print(f"\n❌ Error during evaluation: {e}")
+        import traceback
+        traceback.print_exc()

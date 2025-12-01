@@ -13,7 +13,7 @@ def search_papers(
     year: Optional[int] = None,
     min_citations: Optional[int] = None,
     year_filter: Literal["exact", "before", "after"] = "exact",
-    limit: int = 20
+    limit: int = 10
 ) -> List[Dict]:
     """
     Search for research papers using Semantic Scholar API.
@@ -115,7 +115,7 @@ def get_paper_details(paper_id: str) -> Optional[Dict]:
         headers = {}
         
         # Add delay for rate limiting
-        time.sleep(1.5)
+        time.sleep(5)
             
         response = requests.get(url, params=params, headers=headers, timeout=10)
         response.raise_for_status()
